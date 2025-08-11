@@ -280,6 +280,12 @@ options:
       - Sets maximum speed (in MB/s) for migrations.
       - A value of 0 is no limit.
     type: int
+  with_local_disks:
+    description:
+      - Enable migration with local disks.
+      - Required when migrating VMs with local disk storage to another node.
+    type: bool
+    default: false
   name:
     description:
       - Specifies the VM name. Name could be non-unique across the cluster.
@@ -880,6 +886,17 @@ EXAMPLES = r"""
     node: sabrewulf-2
     migrate: true
 
+- name: Migrate VM with local disks to another node
+  community.proxmox.proxmox_kvm:
+    api_user: root@pam
+    api_password: secret
+    api_host: helldorado
+    name: vm-with-local-storage
+    node: target-node
+    migrate: true
+    with_local_disks: true
+    migrate_speed: 100  # 100 MB/s bandwidth limit
+
 - name: Add hookscript to existing VM
   community.proxmox.proxmox_kvm:
     api_user: root@pam
@@ -917,6 +934,14 @@ from ansible_collections.community.proxmox.plugins.module_utils.version import L
 from ansible_collections.community.proxmox.plugins.module_utils.proxmox import (proxmox_auth_argument_spec, ProxmoxAnsible)
 
 from ansible.module_utils.basic import AnsibleModule
+try:
+    from ansible.module_utils.basic import AnsibleExitJson, AnsibleFailJson
+except ImportError:
+    # For older Ansible versions that don't have these exceptions exported
+    class AnsibleExitJson(Exception):
+        pass
+    class AnsibleFailJson(Exception):  
+        pass
 from ansible.module_utils.parsing.convert_bool import boolean
 
 
@@ -1195,10 +1220,20 @@ class ProxmoxKvmAnsible(ProxmoxAnsible):
             self.module.fail_json(vmid=vmid, msg="conversion of VM %s to template failed with exception: %s" % (vmid, e))
             return False
 
-    def migrate_vm(self, vm, target_node):
+    def migrate_vm(self, vm, target_node, **kwargs):
         vmid = vm['vmid']
         proxmox_node = self.proxmox_api.nodes(vm['node'])
-        taskid = proxmox_node.qemu(vmid).migrate.post(vmid=vmid, node=vm['node'], target=target_node, online=1)
+        
+        # Build migration parameters
+        migrate_params = {'vmid': vmid, 'node': vm['node'], 'target': target_node, 'online': 1}
+        
+        # Add optional parameters
+        if kwargs.get('with_local_disks'):
+            migrate_params['with-local-disks'] = 1
+        if kwargs.get('migrate_speed') is not None:
+            migrate_params['bwlimit'] = kwargs['migrate_speed'] * 1024  # Convert MB/s to KiB/s
+        
+        taskid = proxmox_node.qemu(vmid).migrate.post(**migrate_params)
         if not self.wait_for_task(vm['node'], taskid):
             self.module.fail_json(msg='Reached timeout while waiting for migrating VM. Last line in task before timeout: %s' %
                                   proxmox_node.tasks(taskid).log.get()[:1])
@@ -1268,6 +1303,7 @@ def main():
         migrate=dict(type='bool', default=False),
         migrate_downtime=dict(type='int'),
         migrate_speed=dict(type='int'),
+        with_local_disks=dict(type='bool', default=False),
         name=dict(type='str'),
         nameservers=dict(type='list', elements='str'),
         net=dict(type='dict'),
@@ -1405,11 +1441,17 @@ def main():
             vm = proxmox.get_vm(vmid)
             vm_node = vm['node']
             if node != vm_node:
-                proxmox.migrate_vm(vm, node)
+                migrate_opts = {k: v for k, v in module.params.items() if k in ['with_local_disks', 'migrate_speed'] and v is not None}
+                proxmox.migrate_vm(vm, node, **migrate_opts)
                 module.exit_json(changed=True, vmid=vmid, msg="VM {0} has been migrated from {1} to {2}".format(vmid, vm_node, node))
             else:
                 module.exit_json(changed=False, vmid=vmid, msg="VM {0} is already on {1}".format(vmid, node))
         except Exception as e:
+            # Check if this is an AnsibleExitJson from module.exit_json() - if so, re-raise it
+            exception_name = type(e).__name__
+            if exception_name in ['AnsibleExitJson', 'AnsibleFailJson']:
+                raise
+            # Handle all other real exceptions
             module.fail_json(vmid=vmid, msg='Unable to migrate VM {0} from {1} to {2}: {3}'.format(vmid, vm_node, node, e))
 
     if state == 'present':
